@@ -1,4 +1,4 @@
-import type { DataLoader, DataLoaderGetBarsParams, DataLoaderSubscribeBarParams, KLineData } from 'klinecharts'
+import type { DataLoader, DataLoaderGetBarsParams, DataLoaderSubscribeBarParams, KLineData, Period } from 'klinecharts'
 
 type BinanceAggTrade = {
   a: number
@@ -10,6 +10,21 @@ type BinanceAggTrade = {
   m: boolean
   M: boolean
 }
+
+type BinanceKline = [
+  number,
+  string,
+  string,
+  string,
+  string,
+  string,
+  number,
+  string,
+  number,
+  string,
+  string,
+  string
+]
 
 type FootprintLevel = { price: number; bid: number; ask: number }
 
@@ -31,120 +46,219 @@ function periodToMs (span: number, type: 'second' | 'minute' | 'hour' | 'day'): 
   }
 }
 
+function periodToBinanceInterval (period: Period): string | null {
+  const { span, type } = period
+  switch (type) {
+    case 'second': return `${span}s`
+    case 'minute': return `${span}m`
+    case 'hour': return `${span}h`
+    case 'day': return `${span}d`
+    case 'week': return `${span}w`
+    case 'month': return `${span}M`
+    default: return null
+  }
+}
+
 function roundToStep (value: number, step: number): number {
   if (step <= 0) return value
   const factor = 1 / step
   return Math.round(value * factor) / factor
 }
 
-async function fetchAggTrades (symbol: string, startTime: number, endTime: number): Promise<BinanceAggTrade[]> {
-  const baseUrl = import.meta.env.DEV ? '/binance' : 'https://api.binance.com'
-  const all: BinanceAggTrade[] = []
-  let cursor = startTime
-  while (cursor < endTime) {
-    const url = `${baseUrl}/api/v3/aggTrades?symbol=${encodeURIComponent(symbol)}&startTime=${cursor}&endTime=${endTime}&limit=1000`
-    const res = await fetch(url)
-    if (!res.ok) throw new Error(`Binance aggTrades failed: ${res.status} ${res.statusText}`)
-    const chunk = (await res.json()) as BinanceAggTrade[]
-    if (chunk.length === 0) break
-    all.push(...chunk)
-    const lastT = chunk[chunk.length - 1]!.T
-    if (lastT >= endTime - 1) break
-    if (chunk.length < 1000) break
-    cursor = lastT + 1
-  }
-  return all
+function normalizeBinanceTimeMs (value: number): number {
+  if (!Number.isFinite(value)) return value
+  return value > 10_000_000_000_000 ? Math.floor(value / 1000) : value
 }
 
-function buildCandlesFromTrades (
-  trades: BinanceAggTrade[],
-  intervalMs: number,
-  step: number
-): KLineData[] {
-  const byTs = new Map<number, {
-    ts: number
-    open: number
-    high: number
-    low: number
-    close: number
-    volume: number
-    levels: Map<number, { bid: number; ask: number }>
-  }>()
+function getBaseUrl (): string {
+  return import.meta.env.DEV ? '/binance' : 'https://api.binance.com'
+}
 
-  for (const t of trades) {
-    const price = Number(t.p)
-    const qty = Number(t.q)
-    if (!Number.isFinite(price) || !Number.isFinite(qty)) continue
+async function fetchKlines (
+  symbol: string,
+  interval: string,
+  startTime: number,
+  endTime: number,
+  limit: number
+): Promise<BinanceKline[]> {
+  const baseUrl = getBaseUrl()
+  const url = `${baseUrl}/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&startTime=${startTime}&endTime=${endTime}&limit=${limit}`
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`Binance klines failed: ${res.status} ${res.statusText}`)
+  return await res.json() as BinanceKline[]
+}
 
-    const ts = Math.floor(t.T / intervalMs) * intervalMs
-    let candle = byTs.get(ts)
-    if (!candle) {
-      candle = {
-        ts,
-        open: price,
-        high: price,
-        low: price,
-        close: price,
-        volume: 0,
-        levels: new Map()
+async function fetchAggTrades (symbol: string, startTime: number, endTime: number): Promise<BinanceAggTrade[]> {
+  const baseUrl = getBaseUrl()
+  const limit = 1000
+  const byAggId = new Map<number, BinanceAggTrade>()
+  let cursorEnd = endTime
+  let guard = 0
+
+  while (cursorEnd >= startTime) {
+    guard++
+    if (guard > 5000) break
+
+    const url = `${baseUrl}/api/v3/aggTrades?symbol=${encodeURIComponent(symbol)}&startTime=${startTime}&endTime=${cursorEnd}&limit=${limit}`
+    const res = await fetch(url)
+    if (!res.ok) throw new Error(`Binance aggTrades failed: ${res.status} ${res.statusText}`)
+    const chunk = await res.json() as BinanceAggTrade[]
+    if (chunk.length === 0) break
+
+    for (const trade of chunk) {
+      trade.T = normalizeBinanceTimeMs(trade.T)
+      if (trade.T >= startTime && trade.T <= endTime) {
+        byAggId.set(trade.a, trade)
       }
-      byTs.set(ts, candle)
     }
 
-    candle.high = Math.max(candle.high, price)
-    candle.low = Math.min(candle.low, price)
-    candle.close = price
-    candle.volume += qty
+    if (chunk.length < limit) break
 
-    const bucket = roundToStep(price, step)
-    const level = candle.levels.get(bucket) ?? { bid: 0, ask: 0 }
-    // Binance: m=true means buyer is the maker => trade initiated by seller (treat as bid/sell volume).
-    if (t.m) level.bid += qty
-    else level.ask += qty
-    candle.levels.set(bucket, level)
+    chunk.sort((a, b) => (a.T - b.T) || (a.a - b.a))
+    const earliestTradeTime = chunk[0]?.T
+    if (!Number.isFinite(earliestTradeTime)) break
+
+    const nextEnd = earliestTradeTime - 1
+    if (nextEnd >= cursorEnd) break
+    cursorEnd = nextEnd
   }
 
-  return [...byTs.values()]
-    .sort((a, b) => a.ts - b.ts)
-    .map(c => {
-      const levels: FootprintLevel[] = [...c.levels.entries()]
-        .sort((a, b) => b[0] - a[0])
-        .map(([price, v]) => ({ price, bid: v.bid, ask: v.ask }))
+  return [...byAggId.values()].sort((a, b) => (a.T - b.T) || (a.a - b.a))
+}
 
-      const footprint: FootprintPayload = { step, levels }
-      return {
-        timestamp: c.ts,
-        open: c.open,
-        high: c.high,
-        low: c.low,
-        close: c.close,
-        volume: c.volume,
-        footprint
-      }
+async function fetchAggTradesChunked (
+  symbol: string,
+  startTime: number,
+  endTime: number,
+  intervalMs: number
+): Promise<BinanceAggTrade[]> {
+  const chunkSpanMs = Math.max(intervalMs, Math.min(intervalMs * 2, 2 * 60_000))
+  const trades: BinanceAggTrade[] = []
+
+  for (let chunkStart = startTime; chunkStart <= endTime; chunkStart += chunkSpanMs) {
+    const chunkEnd = Math.min(endTime, chunkStart + chunkSpanMs - 1)
+    const chunkTrades = await fetchAggTrades(symbol, chunkStart, chunkEnd)
+    trades.push(...chunkTrades)
+  }
+
+  return trades
+}
+
+function buildFootprintLevels (trades: BinanceAggTrade[], step: number): FootprintLevel[] {
+  const levelByPrice = new Map<number, { bid: number; ask: number }>()
+
+  for (const trade of trades) {
+    const price = Number(trade.p)
+    const qty = Number(trade.q)
+    if (!Number.isFinite(price) || !Number.isFinite(qty)) continue
+
+    const bucket = roundToStep(price, step)
+    const level = levelByPrice.get(bucket) ?? { bid: 0, ask: 0 }
+    if (trade.m) level.bid += qty
+    else level.ask += qty
+    levelByPrice.set(bucket, level)
+  }
+
+  return [...levelByPrice.entries()]
+    .sort((a, b) => b[0] - a[0])
+    .map(([price, volume]) => ({ price, bid: volume.bid, ask: volume.ask }))
+}
+
+async function buildCandlesFromKlines (
+  symbol: string,
+  klines: BinanceKline[],
+  intervalMs: number,
+  step: number
+): Promise<KLineData[]> {
+  const footprints = await Promise.all(
+    klines.map(async kline => {
+      const openTime = normalizeBinanceTimeMs(kline[0])
+      const closeTime = normalizeBinanceTimeMs(kline[6])
+      const trades = await fetchAggTradesChunked(symbol, openTime, closeTime, intervalMs)
+      return buildFootprintLevels(trades, step)
     })
+  )
+
+  return klines
+    .map((kline, index) => ({
+      timestamp: normalizeBinanceTimeMs(kline[0]),
+      open: Number(kline[1]),
+      high: Number(kline[2]),
+      low: Number(kline[3]),
+      close: Number(kline[4]),
+      volume: Number(kline[5]),
+      footprint: { step, levels: footprints[index] ?? [] }
+    }))
+    .filter(candle => [candle.open, candle.high, candle.low, candle.close, candle.volume].every(Number.isFinite))
 }
 
 export function createBinanceFootprintDatafeed (opts?: {
   symbol?: string
   step?: number
   maxBars?: number
+  initialBars?: number
+  pageBars?: number
   subscribeIntervalMs?: number
 }): DataLoader {
   const symbol = opts?.symbol ?? 'BTCUSDT'
   const step = opts?.step ?? 1
-  const maxBars = clamp(opts?.maxBars ?? 120, 20, 500)
+  const maxBars = clamp(opts?.maxBars ?? 1000, 20, 1000)
+  const initialBars = clamp(opts?.initialBars ?? Math.min(20, maxBars), 10, maxBars)
+  const pageBars = clamp(opts?.pageBars ?? Math.min(20, maxBars), 10, maxBars)
   const subscribeIntervalMs = clamp(opts?.subscribeIntervalMs ?? 2500, 1000, 10_000)
 
   let timer: number | null = null
+  let loadedBars = 0
 
   const getBars = async (params: DataLoaderGetBarsParams): Promise<void> => {
-    const { period, callback, type } = params
-    const intervalMs = periodToMs(period.span, period.type === 'week' || period.type === 'month' || period.type === 'year' ? 'day' : period.type)
-    const endTime = Date.now()
-    const startTime = endTime - maxBars * intervalMs
+    const { period, callback, type, timestamp } = params
+    const normalizedType = period.type === 'week' || period.type === 'month' || period.type === 'year' ? 'day' : period.type
+    const intervalMs = periodToMs(period.span, normalizedType)
+    const binanceInterval = periodToBinanceInterval(period)
+
+    if (binanceInterval == null) {
+      callback([], false)
+      return
+    }
+
+    let startTime = 0
+    let endTime = 0
+    let requestBars = 0
+
     try {
-      const trades = await fetchAggTrades(symbol, startTime, endTime)
-      callback(buildCandlesFromTrades(trades, intervalMs, step), false)
+      if (type === 'init') {
+        requestBars = initialBars
+        endTime = Date.now()
+        startTime = endTime - requestBars * intervalMs
+      } else if (type === 'forward') {
+        if (!Number.isFinite(timestamp ?? NaN)) {
+          callback([], { forward: false })
+          return
+        }
+        requestBars = pageBars
+        endTime = (timestamp as number) - 1
+        startTime = Math.max(0, endTime - requestBars * intervalMs)
+      } else if (type === 'backward') {
+        callback([], { backward: false })
+        return
+      } else {
+        callback([], false)
+        return
+      }
+
+      const klines = await fetchKlines(symbol, binanceInterval, startTime, endTime, Math.min(maxBars, requestBars + 2))
+      let candles = await buildCandlesFromKlines(symbol, klines, intervalMs, step)
+      if (type === 'init') {
+        candles = candles.slice(-requestBars)
+        loadedBars = candles.length
+        callback(candles, { forward: loadedBars < maxBars, backward: false })
+        return
+      }
+
+      const boundaryTimestamp = timestamp as number
+      candles = candles.filter(candle => candle.timestamp < boundaryTimestamp).slice(-requestBars)
+      loadedBars = Math.min(maxBars, loadedBars + candles.length)
+      callback(candles, { forward: candles.length > 0 && loadedBars < maxBars })
     } catch (err) {
       console.error('[binanceFootprintDatafeed] getBars failed', { symbol, startTime, endTime, intervalMs, type, err })
       callback([], false)
@@ -153,16 +267,20 @@ export function createBinanceFootprintDatafeed (opts?: {
 
   const subscribeBar = (params: DataLoaderSubscribeBarParams): void => {
     const { period, callback } = params
-    const intervalMs = periodToMs(period.span, period.type === 'week' || period.type === 'month' || period.type === 'year' ? 'day' : period.type)
+    const normalizedType = period.type === 'week' || period.type === 'month' || period.type === 'year' ? 'day' : period.type
+    const intervalMs = periodToMs(period.span, normalizedType)
+    const binanceInterval = periodToBinanceInterval(period)
+    if (binanceInterval == null) return
+
     if (timer != null) window.clearInterval(timer)
     timer = window.setInterval(async () => {
       try {
         const endTime = Date.now()
-        const startTime = endTime - intervalMs
-        const trades = await fetchAggTrades(symbol, startTime, endTime)
-        const candles = buildCandlesFromTrades(trades, intervalMs, step)
+        const startTime = endTime - intervalMs * 2
+        const klines = await fetchKlines(symbol, binanceInterval, startTime, endTime, 3)
+        const candles = await buildCandlesFromKlines(symbol, klines, intervalMs, step)
         const last = candles[candles.length - 1]
-        if (last) callback(last)
+        if (last != null) callback(last)
       } catch (err) {
         console.warn('[binanceFootprintDatafeed] subscribeBar tick failed', { symbol, intervalMs, err })
       }

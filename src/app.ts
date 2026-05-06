@@ -40,7 +40,7 @@ export default function setupApp (root: HTMLDivElement): void {
 
     chart.setSymbol({ pricePrecision: 2, volumePrecision: 3 })
     chart.setPeriod({ type: 'minute', span: 1 })
-    chart.setDataLoader(createBinanceFootprintDatafeed({ symbol: 'BTCUSDT', step: 1, maxBars: 140 }))
+    chart.setDataLoader(createBinanceFootprintDatafeed({ symbol: 'BTCUSDT', step: 1, maxBars: 1000, initialBars: 20, pageBars: 20 }))
 
     chart.createIndicator('VOL', true)
     chart.scrollToRealTime(0)
