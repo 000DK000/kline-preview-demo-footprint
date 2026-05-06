@@ -70,6 +70,10 @@ function normalizeBinanceTimeMs (value: number): number {
   return value > 10_000_000_000_000 ? Math.floor(value / 1000) : value
 }
 
+function alignTimestampToInterval (timestamp: number, intervalMs: number): number {
+  return Math.floor(normalizeBinanceTimeMs(timestamp) / intervalMs) * intervalMs
+}
+
 function getBaseUrl (): string {
   return import.meta.env.DEV ? '/binance' : 'https://api.binance.com'
 }
@@ -190,6 +194,8 @@ async function buildCandlesFromKlines (
       footprint: { step, levels: footprints[index] ?? [] }
     }))
     .filter(candle => [candle.open, candle.high, candle.low, candle.close, candle.volume].every(Number.isFinite))
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .filter((candle, index, candles) => candle.timestamp !== candles[index - 1]?.timestamp)
 }
 
 export function createBinanceFootprintDatafeed (opts?: {
@@ -202,7 +208,7 @@ export function createBinanceFootprintDatafeed (opts?: {
 }): DataLoader {
   const symbol = opts?.symbol ?? 'BTCUSDT'
   const step = opts?.step ?? 1
-  const maxBars = clamp(opts?.maxBars ?? 1000, 20, 1000)
+  const maxBars = clamp(opts?.maxBars ?? 3000, 20, 3000)
   const initialBars = clamp(opts?.initialBars ?? Math.min(20, maxBars), 10, maxBars)
   const pageBars = clamp(opts?.pageBars ?? Math.min(20, maxBars), 10, maxBars)
   const subscribeIntervalMs = clamp(opts?.subscribeIntervalMs ?? 2500, 1000, 10_000)
@@ -228,16 +234,18 @@ export function createBinanceFootprintDatafeed (opts?: {
     try {
       if (type === 'init') {
         requestBars = initialBars
-        endTime = Date.now()
-        startTime = endTime - requestBars * intervalMs
+        const lastBarOpenTime = alignTimestampToInterval(Date.now(), intervalMs)
+        endTime = lastBarOpenTime + intervalMs - 1
+        startTime = Math.max(0, endTime - requestBars * intervalMs + 1)
       } else if (type === 'forward') {
         if (!Number.isFinite(timestamp ?? NaN)) {
           callback([], { forward: false })
           return
         }
         requestBars = pageBars
-        endTime = (timestamp as number) - 1
-        startTime = Math.max(0, endTime - requestBars * intervalMs)
+        const boundaryTimestamp = alignTimestampToInterval(timestamp as number, intervalMs)
+        endTime = boundaryTimestamp - 1
+        startTime = Math.max(0, endTime - requestBars * intervalMs + 1)
       } else if (type === 'backward') {
         callback([], { backward: false })
         return
@@ -246,7 +254,7 @@ export function createBinanceFootprintDatafeed (opts?: {
         return
       }
 
-      const klines = await fetchKlines(symbol, binanceInterval, startTime, endTime, Math.min(maxBars, requestBars + 2))
+      const klines = await fetchKlines(symbol, binanceInterval, startTime, endTime, Math.min(maxBars, requestBars + 1))
       let candles = await buildCandlesFromKlines(symbol, klines, intervalMs, step)
       if (type === 'init') {
         candles = candles.slice(-requestBars)
