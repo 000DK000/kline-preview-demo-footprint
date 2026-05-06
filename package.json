@@ -4,8 +4,8 @@
   "version": "0.0.1",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
+    "dev": "node init && vite",
+    "build": "node init && vite build",
     "preview": "vite preview",
     "deploy": "npm run build && gh-pages -d dist"
   },
@@ -16,6 +16,8 @@
   },
   "dependencies": {
     "@klinecharts/pro": "^0.1.1",
-    "klinecharts": "^9.8.6"
+    "dotenv": "^8.2.0",
+    "klinecharts": "^9.8.6",
+    "node-fetch": "^3.3.2"
   }
 }
